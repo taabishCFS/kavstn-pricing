@@ -1,0 +1,35 @@
+# shopify.app.toml
+# ════════════════════════════════════════════════════════════
+# KAVSTN Pricing — Shopify Custom App Configuration
+#
+# This file is used by Shopify CLI to manage the app.
+# Replace YOUR_API_KEY_HERE with the API key from your app.
+#
+# To deploy/sync:
+#   shopify app deploy
+# ════════════════════════════════════════════════════════════
+
+name       = "KAVSTN Pricing"
+client_id  = "b9639e218ebba4775dc2f6c14697bb23"
+
+# The Render.com URL where your server.js is hosted
+application_url = "https://kavstn-pricing.onrender.com"
+
+# This app is NOT embedded in Shopify admin (it's a background service)
+embedded = false
+
+[access_scopes]
+# write_products — needed to update the variant price before checkout
+scopes = "write_products"
+
+[auth]
+redirect_urls = [
+  "https://kavstn-pricing.onrender.com/auth/callback"
+]
+
+[webhooks]
+api_version = "2026-07"
+
+[build]
+automatically_update_urls_on_dev = true
+dev_store_url = "kavstn.myshopify.com"
