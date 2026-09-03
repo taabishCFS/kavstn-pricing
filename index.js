@@ -1240,13 +1240,42 @@ app.get('/debug-api', async (req, res) => {
     results.auth = { ok: false, error: err.message };
   }
 
-  // ── 2. Metaobject read scope check ─────────────────────────
-  // Asks Shopify to list the first 3 metaobject definitions.
-  // Returns an empty array if the scope is missing or no metaobjects exist.
+  // ── 2. What scopes does the token actually have at runtime? ──
+  // The Partner dashboard lists *requested* scopes. This shows what
+  // Shopify actually granted to this token after store installation.
   try {
-    const scopeCheckQuery = `
+    const scopesQuery = `
       {
-        metaobjectDefinitions(first: 3) {
+        currentAppInstallation {
+          accessScopes {
+            handle
+          }
+        }
+      }
+    `;
+
+    const scopeData = await shopifyGraphQL(scopesQuery, {});
+    const granted = (
+      scopeData?.currentAppInstallation?.accessScopes || []
+    ).map(s => s.handle);
+
+    results.grantedScopes = {
+      ok:     true,
+      scopes: granted,
+      hasReadMetaobjects: granted.includes('read_metaobjects'),
+      note:   granted.includes('read_metaobjects')
+        ? 'read_metaobjects is granted ✓'
+        : 'read_metaobjects is NOT in the granted scopes — this is why metaobject nodes return empty.',
+    };
+  } catch (err) {
+    results.grantedScopes = { ok: false, error: err.message };
+  }
+
+  // ── 3. Metaobject definitions (only meaningful if scope is granted) ──
+  try {
+    const defsQuery = `
+      {
+        metaobjectDefinitions(first: 10) {
           edges {
             node {
               type
@@ -1258,25 +1287,25 @@ app.get('/debug-api', async (req, res) => {
       }
     `;
 
-    const data = await shopifyGraphQL(scopeCheckQuery, {});
+    const defsData = await shopifyGraphQL(defsQuery, {});
 
     const definitions = (
-      data?.metaobjectDefinitions?.edges || []
+      defsData?.metaobjectDefinitions?.edges || []
     ).map(edge => ({
-      type: edge.node.type,
-      name: edge.node.name,
+      type:   edge.node.type,
+      name:   edge.node.name,
       fields: edge.node.fieldDefinitions.map(f => f.key),
     }));
 
-    results.metaobjectScope = {
+    results.metaobjectDefinitions = {
       ok:          true,
       definitions: definitions,
       note:        definitions.length === 0
-        ? 'No metaobject definitions found — either none exist in this store, or read_metaobjects scope is missing.'
+        ? 'No definitions found — either none exist in this store, or read_metaobjects scope is not granted.'
         : `Found ${definitions.length} definition(s).`,
     };
   } catch (err) {
-    results.metaobjectScope = { ok: false, error: err.message };
+    results.metaobjectDefinitions = { ok: false, error: err.message };
   }
 
   res.json(results);
