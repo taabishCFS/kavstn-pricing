@@ -1212,6 +1212,76 @@ app.use(
   }
 );
 
+/*
+ * ── /debug-api ────────────────────────────────────────────────
+ * Diagnostic endpoint — open in a browser to check whether the
+ * server's Shopify credentials work and what scopes are available.
+ *
+ * URL:  https://kavstn-pricing.onrender.com/debug-api
+ *
+ * It runs two tests:
+ *   1. Fetches an access token (confirms client_id/secret/domain)
+ *   2. Runs a lightweight metaobjects query (confirms read_metaobjects scope)
+ *
+ * REMOVE THIS ENDPOINT before going live — it exposes internal state.
+ */
+app.get('/debug-api', async (req, res) => {
+  const results = {};
+
+  // ── 1. Auth token ──────────────────────────────────────────
+  try {
+    const token = await getShopifyAdminToken();
+    results.auth = {
+      ok:    true,
+      token: token.slice(0, 8) + '…',   // show only the first 8 chars for safety
+      store: process.env.SHOPIFY_STORE_DOMAIN,
+    };
+  } catch (err) {
+    results.auth = { ok: false, error: err.message };
+  }
+
+  // ── 2. Metaobject read scope check ─────────────────────────
+  // Asks Shopify to list the first 3 metaobject definitions.
+  // Returns an empty array if the scope is missing or no metaobjects exist.
+  try {
+    const scopeCheckQuery = `
+      {
+        metaobjectDefinitions(first: 3) {
+          edges {
+            node {
+              type
+              name
+              fieldDefinitions { key }
+            }
+          }
+        }
+      }
+    `;
+
+    const data = await shopifyGraphQL(scopeCheckQuery, {});
+
+    const definitions = (
+      data?.metaobjectDefinitions?.edges || []
+    ).map(edge => ({
+      type: edge.node.type,
+      name: edge.node.name,
+      fields: edge.node.fieldDefinitions.map(f => f.key),
+    }));
+
+    results.metaobjectScope = {
+      ok:          true,
+      definitions: definitions,
+      note:        definitions.length === 0
+        ? 'No metaobject definitions found — either none exist in this store, or read_metaobjects scope is missing.'
+        : `Found ${definitions.length} definition(s).`,
+    };
+  } catch (err) {
+    results.metaobjectScope = { ok: false, error: err.message };
+  }
+
+  res.json(results);
+});
+
 app.listen(PORT, () => {
   console.log(
     `KAVSTN Secure Pricing API running on port ${PORT}`
