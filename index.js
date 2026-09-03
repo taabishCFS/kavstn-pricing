@@ -170,17 +170,28 @@ async function shopifyGraphQL(query, variables = {}) {
   return data.data;
 }
 
+/*
+ * Maps each incoming selection key to the Shopify metaobject type it must
+ * resolve to. The type string here must match the `type` field that
+ * Shopify's Admin API returns — check your Render logs after the first
+ * Add to Order attempt to see what types are actually returned.
+ *
+ * Common issue: merchant-defined metaobject types may be prefixed in the
+ * Admin API (e.g. "custom.table_shape" instead of "table_shape"), even
+ * though Liquid lets you query them without the prefix. If your Render
+ * logs show "custom.table_shape", change the values below to match.
+ */
 const selectionSchema = {
-  shapeId: 'table_shape',
-  dimensionId: 'dimension_preset',
-  materialId: 'table_material',
-  baseDesignId: 'base_design',
-  baseMaterialId: 'base_material',
-  materialFinishId: 'material_finish',
-  edgeProfileId: 'edge_profile',
-  thicknessId: 'table_thickness',
+  shapeId:            'table_shape',
+  dimensionId:        'dimension_preset',
+  materialId:         'table_material',
+  baseDesignId:       'base_design',
+  baseMaterialId:     'base_material',
+  materialFinishId:   'material_finish',
+  edgeProfileId:      'edge_profile',
+  thicknessId:        'table_thickness',
   surfaceTreatmentId: 'surface_treatment',
-  baseFinishId: 'base_finish',
+  baseFinishId:       'base_finish',
 };
 
 const pricingMetaobjectsQuery = `
@@ -376,10 +387,28 @@ async function verifyAndPrice(selections) {
     { ids }
   );
 
+  const returnedNodes = (data.nodes || []).filter(Boolean);
+
+  /*
+   * ── Debug logging ──────────────────────────────────────────
+   * Logs the metaobject types Shopify actually returned so you
+   * can verify they match the expected types in selectionSchema.
+   * Check your Render service logs after triggering an Add to Order.
+   *
+   * If the types include a prefix (e.g. "custom.table_shape" instead
+   * of "table_shape"), update selectionSchema below to match.
+   *
+   * Remove these console.logs once everything is working correctly.
+   */
+  console.log('[KAVSTN] Requested GIDs:', ids);
+  console.log('[KAVSTN] Shopify returned metaobjects:', returnedNodes.map(n => ({
+    id:          n.id,
+    type:        n.type,
+    displayName: n.displayName,
+  })));
+
   const byId = new Map(
-    (data.nodes || [])
-      .filter(Boolean)
-      .map(node => [node.id, node])
+    returnedNodes.map(node => [node.id, node])
   );
 
   const selected = {};
@@ -393,8 +422,14 @@ async function verifyAndPrice(selections) {
         !metaobject ||
         metaobject.type !== expectedType
       ) {
+        /*
+         * The type mismatch error — check the Render logs above to see
+         * what type Shopify actually returned for this metaobject ID.
+         * The type logged there must match the value in selectionSchema.
+         */
         throw new ClientError(
-          `${key} does not reference a valid ${expectedType} option.`
+          `${key} does not reference a valid ${expectedType} option. ` +
+          `(actual type: ${metaobject ? metaobject.type : 'not found'})`
         );
       }
 
