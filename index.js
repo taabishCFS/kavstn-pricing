@@ -327,9 +327,20 @@ app.post('/add-to-order', async (req, res) => {
         input: { lineItems },
       });
 
-      const errors = result.data?.draftOrderUpdate?.userErrors || [];
-      if (errors.length > 0) {
-        throw new Error(errors.map(e => e.message).join(', '));
+      // Check for top-level GraphQL errors (e.g. invalid token, bad query)
+      if (result.errors?.length) {
+        throw new Error('Shopify error: ' + result.errors.map(e => e.message).join(', '));
+      }
+
+      // Check for mutation-level user errors (e.g. invalid input)
+      const updateErrors = result.data?.draftOrderUpdate?.userErrors || [];
+      if (updateErrors.length > 0) {
+        throw new Error(updateErrors.map(e => e.message).join(', '));
+      }
+
+      // Guard: Shopify sometimes returns draftOrderUpdate: null when errors occur above the userErrors level
+      if (!result.data?.draftOrderUpdate?.draftOrder) {
+        throw new Error('Shopify did not return the updated draft order. Check your Admin API token has write_draft_orders permission.');
       }
 
       return res.json({
@@ -357,9 +368,20 @@ app.post('/add-to-order', async (req, res) => {
         input: { lineItems },
       });
 
-      const errors = result.data?.draftOrderCreate?.userErrors || [];
-      if (errors.length > 0) {
-        throw new Error(errors.map(e => e.message).join(', '));
+      // Check for top-level GraphQL errors (e.g. invalid token, bad query)
+      if (result.errors?.length) {
+        throw new Error('Shopify error: ' + result.errors.map(e => e.message).join(', '));
+      }
+
+      // Check for mutation-level user errors (e.g. invalid input)
+      const createErrors = result.data?.draftOrderCreate?.userErrors || [];
+      if (createErrors.length > 0) {
+        throw new Error(createErrors.map(e => e.message).join(', '));
+      }
+
+      // Guard: Shopify sometimes returns draftOrderCreate: null when errors occur above the userErrors level
+      if (!result.data?.draftOrderCreate?.draftOrder) {
+        throw new Error('Shopify did not return the new draft order. Check your Admin API token has write_draft_orders permission.');
       }
 
       return res.json({

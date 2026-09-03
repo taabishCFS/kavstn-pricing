@@ -20,7 +20,7 @@ embedded = false
 
 [access_scopes]
 # write_products — needed to update the variant price before checkout
-scopes = "write_products"
+scopes = "write_products,write_draft_orders"
 
 [auth]
 redirect_urls = [
