@@ -1,45 +1,45 @@
 /**
- * KAVSTN Pricing API — server.js
- * ════════════════════════════════════════════════════════════
- * Hosted on Render.com. Push to GitHub to auto-deploy.
+ * KAVSTN secure pricing + Draft Order API
  *
- * Endpoints:
- *   GET  /                    Health check
- *   POST /price               Calculate price from configuration
- *   POST /auth/exchange-token Exchange shpss_ → shpat_ (run ONCE)
- *   POST /set-price           Update Shopify variant price before cart
- *   POST /add-to-order        Create / append to a Shopify Draft Order
- *                             (use this instead of /set-price for new orders —
- *                              each table gets its own locked price so multiple
- *                              tables in one order all show the correct price)
- *
- * REQUIRED ENVIRONMENT VARIABLES ON RENDER:
- *   SHOPIFY_STORE_DOMAIN   e.g. kavstn.myshopify.com
- *   SHOPIFY_API_KEY        from your Shopify app (API key)
- *   SHOPIFY_API_SECRET     from your Shopify app (API secret key)
- *   SHOPIFY_ADMIN_TOKEN    shpat_xxxx — filled in AFTER running /auth/exchange-token once
- *   SHOPIFY_VARIANT_ID     57237357494438
- * ════════════════════════════════════════════════════════════
+ * The browser sends Shopify metaobject IDs only. This server reads the
+ * authoritative values from Shopify, validates relationships, calculates the
+ * ex-VAT price, and creates or updates a Draft Order with that verified price.
  */
 
 const express = require('express');
-const cors    = require('cors');
+const cors = require('cors');
+const crypto = require('crypto');
 
-const app  = express();
+const app = express();
 const PORT = process.env.PORT || 3000;
+const SHOPIFY_API_VERSION = '2026-07';
 
-app.use(cors());
-app.use(express.json());
+const defaultOrigins = [
+  'https://kavstn.co.uk',
+  'https://www.kavstn.co.uk',
+  'https://kavstn.myshopify.com',
+];
 
+const allowedOrigins = new Set(
+  (process.env.ALLOWED_ORIGINS || defaultOrigins.join(','))
+    .split(',')
+    .map(origin => origin.trim().replace(/\/$/, ''))
+    .filter(Boolean)
+);
 
-// ── Health check ──────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({
-    service: 'KAVSTN Pricing API',
-    version: '2.0.0',
-    status:  'running',
-  });
-});
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin.replace(/\/$/, ''))) {
+      return callback(null, true);
+    }
+
+    return callback(new Error('Origin is not allowed.'));
+  },
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type'],
+}));
+
+app.use(express.json({ limit: '32kb' }));
 
 let cachedAdminToken = null;
 let adminTokenExpiresAt = 0;
@@ -58,7 +58,7 @@ async function getShopifyAdminToken() {
 
   if (!shop || !clientId || !clientSecret) {
     throw new Error(
-      'Missing SHOPIFY_STORE_DOMAIN, SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET'
+      'Missing SHOPIFY_STORE_DOMAIN, SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET.'
     );
   }
 
@@ -69,14 +69,14 @@ async function getShopifyAdminToken() {
 
       headers: {
         Accept: 'application/json',
-        'Content-Type': 'application/x-www-form-urlencoded'
+        'Content-Type': 'application/x-www-form-urlencoded',
       },
 
       body: new URLSearchParams({
         grant_type: 'client_credentials',
         client_id: clientId,
-        client_secret: clientSecret
-      })
+        client_secret: clientSecret,
+      }),
     }
   );
 
@@ -100,40 +100,44 @@ async function getShopifyAdminToken() {
 
   if (!data.access_token) {
     throw new Error(
-      `Shopify did not return an access token: ${responseText}`
+      'Shopify did not return an access token.'
     );
   }
 
   cachedAdminToken = data.access_token;
 
   adminTokenExpiresAt =
-    Date.now() + (Number(data.expires_in) || 86400) * 1000;
+    Date.now() +
+    (Number(data.expires_in) || 86400) * 1000;
 
   return cachedAdminToken;
 }
 
-/**
- * shopifyGraphQL(query, variables)
- * ─────────────────────────────────
- * Shared helper used by /set-price and /add-to-order.
- * Fetches an admin token via getShopifyAdminToken() (cached / auto-refreshed),
- * sends the GraphQL request, and returns the parsed response body.
- * Throws on HTTP errors so callers can catch and return a clean error response.
- */
 async function shopifyGraphQL(query, variables = {}) {
-  const shop  = process.env.SHOPIFY_STORE_DOMAIN;
-  const token = await getShopifyAdminToken();
+  const shop = process.env.SHOPIFY_STORE_DOMAIN;
+
+  if (!shop) {
+    throw new Error(
+      'Missing SHOPIFY_STORE_DOMAIN.'
+    );
+  }
 
   const response = await fetch(
-    `https://${shop}/admin/api/2026-07/graphql.json`,
+    `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
     {
       method: 'POST',
+
       headers: {
-        Accept:                  'application/json',
-        'Content-Type':          'application/json',
-        'X-Shopify-Access-Token': token,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token':
+          await getShopifyAdminToken(),
       },
-      body: JSON.stringify({ query, variables }),
+
+      body: JSON.stringify({
+        query,
+        variables,
+      }),
     }
   );
 
@@ -146,6 +150,7 @@ async function shopifyGraphQL(query, variables = {}) {
   }
 
   let data;
+
   try {
     data = JSON.parse(responseText);
   } catch {
@@ -154,436 +159,1026 @@ async function shopifyGraphQL(query, variables = {}) {
     );
   }
 
-  return data;
+  if (data.errors?.length) {
+    throw new Error(
+      `Shopify GraphQL error: ${data.errors
+        .map(error => error.message)
+        .join(', ')}`
+    );
+  }
+
+  return data.data;
 }
 
-app.get('/auth/status', async (req, res) => {
+const selectionSchema = {
+  shapeId: 'table_shape',
+  dimensionId: 'dimension_preset',
+  materialId: 'table_material',
+  baseDesignId: 'base_design',
+  baseMaterialId: 'base_material',
+  materialFinishId: 'material_finish',
+  edgeProfileId: 'edge_profile',
+  thicknessId: 'table_thickness',
+  surfaceTreatmentId: 'surface_treatment',
+  baseFinishId: 'base_finish',
+};
+
+const pricingMetaobjectsQuery = `
+  query GetPricingMetaobjects($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on Metaobject {
+        id
+        type
+        displayName
+        fields {
+          key
+          value
+        }
+      }
+    }
+  }
+`;
+
+class ClientError extends Error {
+  constructor(message) {
+    super(message);
+    this.status = 400;
+  }
+}
+
+function assertMetaobjectGid(value, key) {
+  const gidPattern =
+    /^gid:\/\/shopify\/Metaobject\/\d+$/;
+
+  if (
+    typeof value !== 'string' ||
+    !gidPattern.test(value)
+  ) {
+    throw new ClientError(
+      `Missing or invalid ${key}.`
+    );
+  }
+
+  return value;
+}
+
+function field(metaobject, key) {
+  const selectedField =
+    metaobject.fields.find(
+      item => item.key === key
+    );
+
+  return selectedField?.value ?? '';
+}
+
+function numberField(metaobject, key) {
+  const value = Number(
+    field(metaobject, key) || 0
+  );
+
+  if (!Number.isFinite(value)) {
+    throw new Error(
+      `Invalid numeric field ${metaobject.type}.${key}.`
+    );
+  }
+
+  return value;
+}
+
+function listValue(raw) {
+  if (!raw) {
+    return [];
+  }
+
   try {
-    await getShopifyAdminToken();
+    const parsed = JSON.parse(raw);
 
-    return res.json({
-      authenticated: true,
-      token_cached: Boolean(cachedAdminToken),
-      expires_at: new Date(adminTokenExpiresAt).toISOString()
-    });
-
-  } catch (error) {
-    console.error('[SHOPIFY AUTH TEST]', error);
-
-    return res.status(500).json({
-      authenticated: false,
-      error: error.message
-    });
-  }
-});
-
-// ── POST /add-to-order ────────────────────────────────────────
-/**
- * WHY THIS EXISTS (and why /set-price breaks with multiple tables)
- * ────────────────────────────────────────────────────────────────
- * /set-price updates a single shared Shopify variant price.
- * When a customer adds 3 tables at different prices, each call
- * overwrites the previous one — all items end up with the LAST price.
- *
- * Shopify Draft Orders fix this: each LINE ITEM has its own locked price,
- * so 3 tables at £2 000 / £3 500 / £4 800 all show correctly at checkout.
- *
- * HOW IT WORKS:
- * ─────────────
- * 1. First table: client sends { price, properties, draftOrderId: null }
- *    → server creates a new Shopify draft order, returns { draftOrderId, invoiceUrl }
- *
- * 2. Client saves draftOrderId in sessionStorage (cleared when tab closes).
- *
- * 3. Subsequent tables: client sends the stored draftOrderId
- *    → server fetches existing line items, appends the new one, updates the order.
- *
- * 4. Customer clicks the invoiceUrl to pay via normal Shopify checkout.
- *    No custom checkout needed — it's the standard Shopify-hosted invoice page.
- *
- * Request body:
- *   {
- *     price:        number,           // ex-VAT price in GBP, e.g. 3490.00
- *     properties:   { key: value },   // all configurator selections
- *     draftOrderId: string | null     // Shopify GID or null for first table
- *   }
- *
- * Response (success):
- *   { success: true, draftOrderId: "gid://shopify/DraftOrder/123", invoiceUrl: "…" }
- *
- * Response (error):
- *   { success: false, error: "message" }
- */
-app.post('/add-to-order', async (req, res) => {
-  const { price, properties, draftOrderId } = req.body;
-
-  /* ── Validate price ─────────────────────────────────────────────────── */
-  const priceNum = parseFloat(price);
-  if (!priceNum || priceNum <= 0) {
-    return res.status(400).json({ success: false, error: 'Invalid price value.' });
+    if (Array.isArray(parsed)) {
+      return parsed.map(String);
+    }
+  } catch {
+    // Use the comma-separated fallback.
   }
 
-  /* ── Build the new line item ────────────────────────────────────────── */
-  /*
-   * Shopify DraftOrderLineItemInput accepts:
-   *   title                — shown on the Shopify invoice
-   *   originalUnitPrice    — the ex-VAT price (Shopify applies tax at checkout)
-   *   quantity             — always 1 per configured table
-   *   customAttributes     — key/value pairs shown on the order as line properties
-   */
-  const newLineItem = {
-    title:             'KAVSTN Bespoke Dining Table',
-    originalUnitPrice: priceNum.toFixed(2),
-    quantity:          1,
-    customAttributes:  Object.entries(properties || {}).map(([key, value]) => ({
-      key,
-      value: String(value),
-    })),
+  return String(raw)
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+}
+
+function referenceIds(metaobject, key) {
+  const raw = field(metaobject, key);
+  const parsed = listValue(raw);
+
+  if (parsed.length) {
+    return parsed.filter(value =>
+      value.startsWith('gid://shopify/')
+    );
+  }
+
+  return raw.startsWith('gid://shopify/')
+    ? [raw]
+    : [];
+}
+
+function textList(metaobject, key) {
+  return listValue(field(metaobject, key))
+    .map(value => value.toLowerCase());
+}
+
+function isUnavailable(metaobject) {
+  const available =
+    field(metaobject, 'available') ||
+    field(metaobject, 'availability');
+
+  const unavailableValues = [
+    'false',
+    'unavailable',
+    'disabled',
+    'inactive',
+  ];
+
+  return unavailableValues.includes(
+    String(available).toLowerCase()
+  );
+}
+
+function requireReference(
+  metaobject,
+  key,
+  expectedId,
+  label
+) {
+  const references =
+    referenceIds(metaobject, key);
+
+  if (
+    references.length &&
+    !references.includes(expectedId)
+  ) {
+    throw new ClientError(
+      `${label} is not compatible with this configuration.`
+    );
+  }
+}
+
+function requireTextCompatibility(
+  metaobject,
+  key,
+  expectedValue,
+  label
+) {
+  const allowed =
+    textList(metaobject, key);
+
+  if (
+    allowed.length &&
+    !allowed.includes(
+      String(expectedValue).toLowerCase()
+    )
+  ) {
+    throw new ClientError(
+      `${label} is not compatible with this configuration.`
+    );
+  }
+}
+
+async function verifyAndPrice(selections) {
+  if (
+    !selections ||
+    typeof selections !== 'object'
+  ) {
+    throw new ClientError(
+      'Configuration selections are required.'
+    );
+  }
+
+  const entries =
+    Object.entries(selectionSchema);
+
+  const ids = entries.map(([key]) =>
+    assertMetaobjectGid(
+      selections[key],
+      key
+    )
+  );
+
+  if (
+    new Set(ids).size !== ids.length
+  ) {
+    throw new ClientError(
+      'Each configuration selection must use its own metaobject ID.'
+    );
+  }
+
+  const data = await shopifyGraphQL(
+    pricingMetaobjectsQuery,
+    { ids }
+  );
+
+  const byId = new Map(
+    (data.nodes || [])
+      .filter(Boolean)
+      .map(node => [node.id, node])
+  );
+
+  const selected = {};
+
+  entries.forEach(
+    ([key, expectedType]) => {
+      const metaobject =
+        byId.get(selections[key]);
+
+      if (
+        !metaobject ||
+        metaobject.type !== expectedType
+      ) {
+        throw new ClientError(
+          `${key} does not reference a valid ${expectedType} option.`
+        );
+      }
+
+      if (isUnavailable(metaobject)) {
+        throw new ClientError(
+          `${metaobject.displayName} is currently unavailable.`
+        );
+      }
+
+      selected[key] = metaobject;
+    }
+  );
+
+  const shape =
+    selected.shapeId;
+
+  const dimension =
+    selected.dimensionId;
+
+  const material =
+    selected.materialId;
+
+  const baseDesign =
+    selected.baseDesignId;
+
+  const baseMaterial =
+    selected.baseMaterialId;
+
+  const materialFinish =
+    selected.materialFinishId;
+
+  const edge =
+    selected.edgeProfileId;
+
+  const thickness =
+    selected.thicknessId;
+
+  const surface =
+    selected.surfaceTreatmentId;
+
+  const baseFinish =
+    selected.baseFinishId;
+
+  requireReference(
+    dimension,
+    'shape',
+    shape.id,
+    'Dimension'
+  );
+
+  requireReference(
+    materialFinish,
+    'material',
+    material.id,
+    'Top finish'
+  );
+
+  requireReference(
+    baseFinish,
+    'base_material',
+    baseMaterial.id,
+    'Base finish'
+  );
+
+  requireTextCompatibility(
+    baseMaterial,
+    'compatible_designs',
+    field(baseDesign, 'base_handle'),
+    'Base material'
+  );
+
+  const materialCategory =
+    field(
+      material,
+      'material_category'
+    );
+
+  requireTextCompatibility(
+    edge,
+    'compatible_materials',
+    materialCategory,
+    'Edge profile'
+  );
+
+  requireTextCompatibility(
+    surface,
+    'compatible_materials',
+    materialCategory,
+    'Surface treatment'
+  );
+
+  const requiresApproval =
+    String(
+      field(
+        dimension,
+        'requires_approval'
+      )
+    ).toLowerCase();
+
+  if (requiresApproval === 'true') {
+    throw new ClientError(
+      'This size requires manual approval and cannot be ordered online yet.'
+    );
+  }
+
+  const shapeHandle =
+    field(
+      shape,
+      'shape_handle'
+    ).toLowerCase();
+
+  const lengthMm =
+    numberField(
+      dimension,
+      'length_cm'
+    ) * 10;
+
+  const widthMm =
+    numberField(
+      dimension,
+      'width_cm'
+    ) * 10;
+
+  const diameterMm =
+    numberField(
+      dimension,
+      'diameter_cm'
+    ) * 10;
+
+  let areaSqm = 0;
+
+  if (
+    shapeHandle === 'round' &&
+    diameterMm > 0
+  ) {
+    const radiusM =
+      diameterMm / 2 / 1000;
+
+    areaSqm =
+      Math.PI *
+      radiusM *
+      radiusM;
+  } else if (
+    (
+      shapeHandle === 'oval' ||
+      shapeHandle === 'racetrack'
+    ) &&
+    lengthMm > 0 &&
+    widthMm > 0
+  ) {
+    areaSqm =
+      Math.PI *
+      (lengthMm / 2 / 1000) *
+      (widthMm / 2 / 1000);
+  } else if (
+    lengthMm > 0 &&
+    widthMm > 0
+  ) {
+    areaSqm =
+      (lengthMm / 1000) *
+      (widthMm / 1000);
+  } else {
+    throw new ClientError(
+      'The selected dimension preset has incomplete measurements.'
+    );
+  }
+
+  const adjustments = {
+    dimension:
+      numberField(
+        dimension,
+        'price_adjustment'
+      ),
+
+    baseMaterial:
+      numberField(
+        baseMaterial,
+        'price_adjustment'
+      ),
+
+    materialFinish:
+      numberField(
+        materialFinish,
+        'price_adjustment'
+      ),
+
+    edge:
+      numberField(
+        edge,
+        'price_adjustment'
+      ),
+
+    thickness:
+      numberField(
+        thickness,
+        'price_adjustment'
+      ),
+
+    surface:
+      numberField(
+        surface,
+        'price_adjustment'
+      ),
+
+    baseFinish:
+      numberField(
+        baseFinish,
+        'price_adjustment'
+      ),
   };
 
-  try {
-    let lineItems;
+  const totalAdjustments =
+    Object.values(adjustments)
+      .reduce(
+        (sum, value) =>
+          sum + value,
+        0
+      );
 
-    if (draftOrderId) {
-      /* ── Append to an existing draft order ─────────────────────────── */
-      /*
-       * draftOrderUpdate replaces ALL line items, so we first fetch the
-       * existing items and merge them with the new one before updating.
-       */
-      const fetchQuery = `
-        query GetDraftOrder($id: ID!) {
-          draftOrder(id: $id) {
-            id
-            status
-            lineItems(first: 50) {
-              edges {
-                node {
-                  title
-                  originalUnitPrice { amount }
-                  quantity
-                  customAttributes { key value }
-                }
-              }
-            }
+  const shapeBasePrice =
+    numberField(
+      shape,
+      'base_price'
+    );
+
+  const materialBasePrice =
+    numberField(
+      material,
+      'base_price'
+    );
+
+  const materialPricePerSqm =
+    numberField(
+      material,
+      'price_per_sqm'
+    );
+
+  const verifiedPrice =
+    shapeBasePrice +
+    materialBasePrice +
+    materialPricePerSqm * areaSqm +
+    totalAdjustments;
+
+  if (
+    !Number.isFinite(verifiedPrice) ||
+    verifiedPrice <= 0
+  ) {
+    throw new Error(
+      'The authoritative Shopify pricing data produced an invalid price.'
+    );
+  }
+
+  const dimensions =
+    diameterMm > 0
+      ? `Diameter ${diameterMm / 10} cm`
+      : `${lengthMm / 10} × ${widthMm / 10} cm`;
+
+  const properties = {
+    Shape:
+      shape.displayName,
+
+    Dimensions:
+      field(dimension, 'label') ||
+      dimensions,
+
+    'Suggested Seating':
+      field(dimension, 'seating') ||
+      '—',
+
+    'Top Material':
+      material.displayName,
+
+    'Base Design':
+      baseDesign.displayName,
+
+    'Base Material':
+      baseMaterial.displayName,
+
+    'Top Finish':
+      materialFinish.displayName,
+
+    'Edge Profile':
+      edge.displayName,
+
+    Thickness:
+      field(thickness, 'label') ||
+      `${field(
+        thickness,
+        'thickness_mm'
+      )} mm`,
+
+    'Surface Treatment':
+      surface.displayName,
+
+    'Base Finish':
+      baseFinish.displayName,
+
+    'Verified Price (ex VAT)':
+      `£${verifiedPrice.toFixed(2)}`,
+
+    '_Shape ID':
+      shape.id,
+
+    '_Dimension ID':
+      dimension.id,
+
+    '_Material ID':
+      material.id,
+
+    '_Base Design ID':
+      baseDesign.id,
+
+    '_Base Material ID':
+      baseMaterial.id,
+  };
+
+  return {
+    price:
+      Math.round(
+        verifiedPrice * 100
+      ) / 100,
+
+    areaSqm:
+      Math.round(
+        areaSqm * 1000
+      ) / 1000,
+
+    properties,
+  };
+}
+
+const getDraftOrderQuery = `
+  query GetDraftOrder($id: ID!) {
+    draftOrder(id: $id) {
+      id
+      status
+
+      lineItems(first: 50) {
+        nodes {
+          title
+          originalUnitPrice
+          quantity
+
+          customAttributes {
+            key
+            value
           }
         }
-      `;
-
-      const fetchData  = await shopifyGraphQL(fetchQuery, { id: draftOrderId });
-      const draftOrder = fetchData.data?.draftOrder;
-
-      if (!draftOrder) {
-        /*
-         * The stored ID is invalid or the order was deleted.
-         * Fall back to creating a fresh order instead of erroring out.
-         */
-        console.warn('[KAVSTN] Draft order not found, creating a new one:', draftOrderId);
-        lineItems = [newLineItem];
-
-      } else if (draftOrder.status !== 'OPEN') {
-        /*
-         * The order was already paid or cancelled — the customer is
-         * starting a new shopping session. Create a fresh order.
-         */
-        console.info('[KAVSTN] Draft order is', draftOrder.status, '— starting fresh order.');
-        lineItems = [newLineItem];
-
-      } else {
-        /* Merge existing items + new item */
-        const existingItems = (draftOrder.lineItems?.edges || []).map(edge => ({
-          title:             edge.node.title,
-          originalUnitPrice: edge.node.originalUnitPrice.amount,
-          quantity:          edge.node.quantity,
-          customAttributes:  edge.node.customAttributes,
-        }));
-        lineItems = [...existingItems, newLineItem];
       }
-
-    } else {
-      /* ── No existing order — start fresh ───────────────────────────── */
-      lineItems = [newLineItem];
     }
+  }
+`;
 
-    /* ── Create or update the draft order ──────────────────────────────── */
-    let result;
-
-    if (draftOrderId && lineItems.length > 1) {
-      /* Append path: update the existing draft order with all line items */
-      const updateMutation = `
-        mutation DraftOrderUpdate($id: ID!, $input: DraftOrderInput!) {
-          draftOrderUpdate(id: $id, input: $input) {
-            draftOrder {
-              id
-              invoiceUrl
-              totalPriceSet { shopMoney { amount currencyCode } }
-            }
-            userErrors { field message }
-          }
-        }
-      `;
-
-      result = await shopifyGraphQL(updateMutation, {
-        id:    draftOrderId,
-        input: { lineItems },
-      });
-
-      // Check for top-level GraphQL errors (e.g. invalid token, bad query)
-      if (result.errors?.length) {
-        throw new Error('Shopify error: ' + result.errors.map(e => e.message).join(', '));
+const createDraftOrderMutation = `
+  mutation DraftOrderCreate(
+    $input: DraftOrderInput!
+  ) {
+    draftOrderCreate(input: $input) {
+      draftOrder {
+        id
+        invoiceUrl
       }
 
-      // Check for mutation-level user errors (e.g. invalid input)
-      const updateErrors = result.data?.draftOrderUpdate?.userErrors || [];
-      if (updateErrors.length > 0) {
-        throw new Error(updateErrors.map(e => e.message).join(', '));
+      userErrors {
+        field
+        message
       }
-
-      // Guard: Shopify sometimes returns draftOrderUpdate: null when errors occur above the userErrors level
-      if (!result.data?.draftOrderUpdate?.draftOrder) {
-        throw new Error('Shopify did not return the updated draft order. Check your Admin API token has write_draft_orders permission.');
-      }
-
-      return res.json({
-        success:      true,
-        draftOrderId: result.data.draftOrderUpdate.draftOrder.id,
-        invoiceUrl:   result.data.draftOrderUpdate.draftOrder.invoiceUrl,
-      });
-
-    } else {
-      /* Create path: brand new draft order with one line item */
-      const createMutation = `
-        mutation DraftOrderCreate($input: DraftOrderInput!) {
-          draftOrderCreate(input: $input) {
-            draftOrder {
-              id
-              invoiceUrl
-              totalPriceSet { shopMoney { amount currencyCode } }
-            }
-            userErrors { field message }
-          }
-        }
-      `;
-
-      result = await shopifyGraphQL(createMutation, {
-        input: { lineItems },
-      });
-
-      // Check for top-level GraphQL errors (e.g. invalid token, bad query)
-      if (result.errors?.length) {
-        throw new Error('Shopify error: ' + result.errors.map(e => e.message).join(', '));
-      }
-
-      // Check for mutation-level user errors (e.g. invalid input)
-      const createErrors = result.data?.draftOrderCreate?.userErrors || [];
-      if (createErrors.length > 0) {
-        throw new Error(createErrors.map(e => e.message).join(', '));
-      }
-
-      // Guard: Shopify sometimes returns draftOrderCreate: null when errors occur above the userErrors level
-      if (!result.data?.draftOrderCreate?.draftOrder) {
-        throw new Error('Shopify did not return the new draft order. Check your Admin API token has write_draft_orders permission.');
-      }
-
-      return res.json({
-        success:      true,
-        draftOrderId: result.data.draftOrderCreate.draftOrder.id,
-        invoiceUrl:   result.data.draftOrderCreate.draftOrder.invoiceUrl,
-      });
     }
-
-  } catch (err) {
-    console.error('[KAVSTN] /add-to-order error:', err.message);
-    return res.status(500).json({ success: false, error: err.message });
   }
-});
+`;
 
-// ── POST /set-price ───────────────────────────────────────────
-/**
- * Called by the configurator just before "Add to Cart".
- * Updates the Shopify product variant price so the cart and
- * checkout show the real configured price, not £0.
- *
- * Body: { "price": 3640.00 }
- *
- * NOTE: For a bespoke furniture brand with low order volume,
- * race conditions are not a concern. If you later have concurrent
- * orders, consider switching to Draft Orders instead.
- *
- * NOTE on VAT: Shopify uses the price you set here as-is.
- * If your store has "Prices include tax" ON → set the inc-VAT price.
- * If "Prices include tax" OFF → set the ex-VAT price (Shopify adds tax).
- * Check: Shopify Admin → Settings → Taxes → "Include tax in prices".
- */
-app.post('/set-price', async (req, res) => {
-  const numericPrice = Number(req.body.price);
-
-  if (!Number.isFinite(numericPrice) || numericPrice <= 0) {
-    return res.status(400).json({
-      error: 'A valid positive price is required'
-    });
-  }
-
-  const shop = process.env.SHOPIFY_STORE_DOMAIN;
-  const productId = process.env.SHOPIFY_PRODUCT_ID;
-  const variantId = process.env.SHOPIFY_VARIANT_ID;
-
-  if (!shop || !productId || !variantId) {
-    return res.status(500).json({
-      error:
-        'Missing SHOPIFY_STORE_DOMAIN, SHOPIFY_PRODUCT_ID or SHOPIFY_VARIANT_ID'
-    });
-  }
-
-  try {
-    const query = `
-      mutation UpdateConfiguredVariantPrice(
-        $productId: ID!
-        $variants: [ProductVariantsBulkInput!]!
-      ) {
-        productVariantsBulkUpdate(
-          productId: $productId
-          variants: $variants
-        ) {
-          productVariants {
-            id
-            price
-          }
-          userErrors {
-            field
-            message
-          }
-        }
+const updateDraftOrderMutation = `
+  mutation DraftOrderUpdate(
+    $id: ID!
+    $input: DraftOrderInput!
+  ) {
+    draftOrderUpdate(
+      id: $id
+      input: $input
+    ) {
+      draftOrder {
+        id
+        invoiceUrl
       }
-    `;
 
-    const data = await shopifyGraphQL(query, {
-      productId: `gid://shopify/Product/${productId}`,
-
-      variants: [
-        {
-          id: `gid://shopify/ProductVariant/${variantId}`,
-          price: numericPrice.toFixed(2)
-        }
-      ]
-    });
-
-    if (data.errors?.length) {
-      return res.status(400).json({
-        error: 'Shopify GraphQL error',
-        details: data.errors
-      });
+      userErrors {
+        field
+        message
+      }
     }
-
-    const result = data.data?.productVariantsBulkUpdate;
-    const userErrors = result?.userErrors || [];
-
-    if (userErrors.length) {
-      return res.status(400).json({
-        error: 'Shopify rejected the price update',
-        details: userErrors
-      });
-    }
-
-    const updatedVariant = result?.productVariants?.[0];
-
-    return res.json({
-      success: true,
-      variant_id: updatedVariant?.id,
-      price: updatedVariant?.price
-    });
-
-  } catch (error) {
-    console.error('[KAVSTN SET PRICE]', error);
-
-    return res.status(500).json({
-      error: error.message
-    });
   }
-});
+`;
 
+function mutationPayload(
+  payload,
+  operationName
+) {
+  const errors =
+    payload?.userErrors || [];
 
-// ── POST /price ───────────────────────────────────────────────
-/**
- * Calculates the table price from the configuration.
- * All price data is sent from the Liquid section (read from metaobjects).
- *
- * Body: {
- *   shape, width_mm, depth_mm, diameter_mm,
- *   material_base_price, material_price_per_sqm,
- *   base_material_adj, mat_finish_adj, edge_adj,
- *   thickness_adj, surface_adj, base_finish_adj
- * }
- */
-app.post('/price', (req, res) => {
-  const {
-    shape          = 'rectangle',
-    width_mm, depth_mm, diameter_mm,
-    material_base_price    = 0,
-    material_price_per_sqm = 0,
-    base_material_adj = 0,
-    mat_finish_adj    = 0,
-    edge_adj          = 0,
-    thickness_adj     = 0,
-    surface_adj       = 0,
-    base_finish_adj   = 0,
-  } = req.body;
-
-  // 1. Calculate area in sqm
-  let area_sqm = 0;
-  if (shape === 'round' && diameter_mm) {
-    const r = (Number(diameter_mm) / 2) / 1000;
-    area_sqm = Math.PI * r * r;
-  } else if (shape === 'oval' && width_mm && depth_mm) {
-    const a = (Number(width_mm)  / 2) / 1000;
-    const b = (Number(depth_mm) / 2) / 1000;
-    area_sqm = Math.PI * a * b;
-  } else if (width_mm && depth_mm) {
-    area_sqm = (Number(width_mm) / 1000) * (Number(depth_mm) / 1000);
+  if (errors.length) {
+    throw new ClientError(
+      errors
+        .map(error => error.message)
+        .join(', ')
+    );
   }
-  area_sqm = Math.round(area_sqm * 1000) / 1000;
 
-  // 2. Material cost
-  const top_material_cost =
-    Number(material_base_price) + (Number(material_price_per_sqm) * area_sqm);
+  if (!payload?.draftOrder) {
+    throw new Error(
+      `Shopify did not return a draft order from ${operationName}.`
+    );
+  }
 
-  // 3. Adjustments
-  const adjustments =
-    Number(base_material_adj) + Number(mat_finish_adj) + Number(edge_adj) +
-    Number(thickness_adj) + Number(surface_adj) + Number(base_finish_adj);
+  return payload.draftOrder;
+}
 
-  // 4. Subtotal + VAT
-  const subtotal = top_material_cost + adjustments;
-  const VAT_RATE = 0.20;
-  const vat      = subtotal * VAT_RATE;
-  const total    = subtotal + vat;
+function signingSecret() {
+  const secret =
+    process.env.DRAFT_ORDER_SIGNING_SECRET;
 
-  const round2 = n => Math.round(n * 100) / 100;
+  if (
+    !secret ||
+    secret.length < 32
+  ) {
+    throw new Error(
+      'DRAFT_ORDER_SIGNING_SECRET must contain at least 32 characters.'
+    );
+  }
 
+  return secret;
+}
+
+function signDraftOrderId(draftOrderId) {
+  const signature = crypto
+    .createHmac(
+      'sha256',
+      signingSecret()
+    )
+    .update(draftOrderId)
+    .digest('base64url');
+
+  const encodedId =
+    Buffer
+      .from(draftOrderId)
+      .toString('base64url');
+
+  return `${encodedId}.${signature}`;
+}
+
+function verifyDraftOrderToken(token) {
+  if (!token) {
+    return null;
+  }
+
+  if (
+    typeof token !== 'string' ||
+    token.length > 500 ||
+    !token.includes('.')
+  ) {
+    throw new ClientError(
+      'Invalid draft order token.'
+    );
+  }
+
+  const [
+    encodedId,
+    suppliedSignature,
+  ] = token.split('.');
+
+  const draftOrderId =
+    Buffer
+      .from(
+        encodedId,
+        'base64url'
+      )
+      .toString('utf8');
+
+  const draftOrderPattern =
+    /^gid:\/\/shopify\/DraftOrder\/\d+$/;
+
+  if (
+    !draftOrderPattern.test(
+      draftOrderId
+    )
+  ) {
+    throw new ClientError(
+      'Invalid draft order token.'
+    );
+  }
+
+  const expectedSignature =
+    crypto
+      .createHmac(
+        'sha256',
+        signingSecret()
+      )
+      .update(draftOrderId)
+      .digest('base64url');
+
+  const supplied =
+    Buffer.from(
+      suppliedSignature || ''
+    );
+
+  const expected =
+    Buffer.from(
+      expectedSignature
+    );
+
+  if (
+    supplied.length !== expected.length ||
+    !crypto.timingSafeEqual(
+      supplied,
+      expected
+    )
+  ) {
+    throw new ClientError(
+      'Invalid draft order token.'
+    );
+  }
+
+  return draftOrderId;
+}
+
+app.get('/', (req, res) => {
   return res.json({
-    total:    round2(total),
-    subtotal: round2(subtotal),
-    vat:      round2(vat),
-    breakdown: {
-      area_sqm,
-      top_material: round2(top_material_cost),
-      adjustments: {
-        base_material:     round2(Number(base_material_adj)),
-        material_finish:   round2(Number(mat_finish_adj)),
-        edge_profile:      round2(Number(edge_adj)),
-        thickness:         round2(Number(thickness_adj)),
-        surface_treatment: round2(Number(surface_adj)),
-        base_finish:       round2(Number(base_finish_adj)),
-      },
-      subtotal:  round2(subtotal),
-      vat_rate: `${VAT_RATE * 100}%`,
-      vat:       round2(vat),
-      total:     round2(total),
-    },
+    service:
+      'KAVSTN Secure Pricing API',
+
+    version:
+      '3.0.0',
+
+    status:
+      'running',
   });
 });
 
+app.get(
+  '/auth/status',
+  async (req, res) => {
+    try {
+      await getShopifyAdminToken();
 
-// ── Start ─────────────────────────────────────────────────────
+      return res.json({
+        authenticated: true,
+        method: 'client_credentials',
+
+        token_cached:
+          Boolean(cachedAdminToken),
+
+        expires_at:
+          new Date(
+            adminTokenExpiresAt
+          ).toISOString(),
+      });
+    } catch (error) {
+      return res
+        .status(500)
+        .json({
+          authenticated: false,
+          error: error.message,
+        });
+    }
+  }
+);
+
+app.post(
+  '/price',
+  async (req, res) => {
+    try {
+      const verified =
+        await verifyAndPrice(
+          req.body.selections
+        );
+
+      return res.json({
+        success: true,
+        price: verified.price,
+        area_sqm: verified.areaSqm,
+      });
+    } catch (error) {
+      console.error(
+        '[KAVSTN] /price error:',
+        error.message
+      );
+
+      return res
+        .status(error.status || 500)
+        .json({
+          success: false,
+          error: error.message,
+        });
+    }
+  }
+);
+
+app.post(
+  '/set-price',
+  (req, res) => {
+    return res.status(410).json({
+      error:
+        'This endpoint is disabled. Use /add-to-order.',
+    });
+  }
+);
+
+app.post(
+  '/add-to-order',
+  async (req, res) => {
+    try {
+      signingSecret();
+
+      const verified =
+        await verifyAndPrice(
+          req.body.selections
+        );
+
+      const requestedDraftOrderId =
+        verifyDraftOrderToken(
+          req.body.draftOrderToken
+        );
+
+      const newLineItem = {
+        title:
+          'KAVSTN Bespoke Dining Table',
+
+        originalUnitPrice:
+          verified.price.toFixed(2),
+
+        quantity: 1,
+
+        customAttributes:
+          Object.entries(
+            verified.properties
+          ).map(
+            ([key, value]) => ({
+              key,
+              value: String(value),
+            })
+          ),
+      };
+
+      let draftOrderId = null;
+
+      let lineItems = [
+        newLineItem,
+      ];
+
+      if (requestedDraftOrderId) {
+        const existingData =
+          await shopifyGraphQL(
+            getDraftOrderQuery,
+            {
+              id: requestedDraftOrderId,
+            }
+          );
+
+        const existing =
+          existingData.draftOrder;
+
+        if (
+          existing?.status === 'OPEN'
+        ) {
+          draftOrderId =
+            existing.id;
+
+          const existingItems =
+            (
+              existing
+                .lineItems
+                ?.nodes || []
+            ).map(node => ({
+              title:
+                node.title,
+
+              originalUnitPrice:
+                node.originalUnitPrice,
+
+              quantity:
+                node.quantity,
+
+              customAttributes:
+                node.customAttributes,
+            }));
+
+          lineItems = [
+            ...existingItems,
+            newLineItem,
+          ];
+        }
+      }
+
+      let draftOrder;
+
+      if (draftOrderId) {
+        const data =
+          await shopifyGraphQL(
+            updateDraftOrderMutation,
+            {
+              id: draftOrderId,
+
+              input: {
+                lineItems,
+              },
+            }
+          );
+
+        draftOrder =
+          mutationPayload(
+            data.draftOrderUpdate,
+            'draftOrderUpdate'
+          );
+      } else {
+        const data =
+          await shopifyGraphQL(
+            createDraftOrderMutation,
+            {
+              input: {
+                lineItems,
+              },
+            }
+          );
+
+        draftOrder =
+          mutationPayload(
+            data.draftOrderCreate,
+            'draftOrderCreate'
+          );
+      }
+
+      return res.json({
+        success: true,
+
+        draftOrderId:
+          draftOrder.id,
+
+        draftOrderToken:
+          signDraftOrderId(
+            draftOrder.id
+          ),
+
+        invoiceUrl:
+          draftOrder.invoiceUrl,
+
+        verifiedPrice:
+          verified.price,
+      });
+    } catch (error) {
+      console.error(
+        '[KAVSTN] /add-to-order error:',
+        error.message
+      );
+
+      return res
+        .status(error.status || 500)
+        .json({
+          success: false,
+          error: error.message,
+        });
+    }
+  }
+);
+
+app.use(
+  (error, req, res, next) => {
+    if (
+      error.message ===
+      'Origin is not allowed.'
+    ) {
+      return res
+        .status(403)
+        .json({
+          success: false,
+          error: error.message,
+        });
+    }
+
+    return next(error);
+  }
+);
+
 app.listen(PORT, () => {
-  console.log(`KAVSTN Pricing API running on port ${PORT}`);
+  console.log(
+    `KAVSTN Secure Pricing API running on port ${PORT}`
+  );
 });
