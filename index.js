@@ -1271,11 +1271,11 @@ app.get('/debug-api', async (req, res) => {
     results.grantedScopes = { ok: false, error: err.message };
   }
 
-  // ── 3. Metaobject definitions (only meaningful if scope is granted) ──
+  // ── 3. Metaobject definitions list ──
   try {
     const defsQuery = `
       {
-        metaobjectDefinitions(first: 10) {
+        metaobjectDefinitions(first: 20) {
           edges {
             node {
               type
@@ -1301,11 +1301,76 @@ app.get('/debug-api', async (req, res) => {
       ok:          true,
       definitions: definitions,
       note:        definitions.length === 0
-        ? 'No definitions found — either none exist in this store, or read_metaobjects scope is not granted.'
+        ? 'No definitions found.'
         : `Found ${definitions.length} definition(s).`,
     };
   } catch (err) {
     results.metaobjectDefinitions = { ok: false, error: err.message };
+  }
+
+  // ── 4. Direct metaobject query — bypasses definitions, hits entries ──
+  // This tells us whether the token can actually read metaobject entries.
+  // We try three type names that may match your store's actual type identifiers.
+  const typesToProbe = ['table_shape', 'dimension_preset', 'table_material'];
+  results.metaobjectEntries = {};
+
+  for (const type of typesToProbe) {
+    try {
+      const entriesQuery = `
+        query ProbeEntries($type: String!) {
+          metaobjects(type: $type, first: 3) {
+            edges {
+              node {
+                id
+                type
+                displayName
+                fields { key value }
+              }
+            }
+          }
+        }
+      `;
+
+      const entriesData = await shopifyGraphQL(entriesQuery, { type });
+      const entries = (entriesData?.metaobjects?.edges || []).map(e => ({
+        id:          e.node.id,
+        type:        e.node.type,
+        displayName: e.node.displayName,
+        fields:      e.node.fields,
+      }));
+
+      results.metaobjectEntries[type] = {
+        ok:    true,
+        count: entries.length,
+        sample: entries,
+      };
+    } catch (err) {
+      results.metaobjectEntries[type] = { ok: false, error: err.message };
+    }
+  }
+
+  // ── 5. Raw GraphQL errors for the definitions query ──
+  // Re-run with full error capture so we can see any "Access denied" messages.
+  try {
+    const shop  = process.env.SHOPIFY_STORE_DOMAIN;
+    const token = await getShopifyAdminToken();
+    const rawResponse = await fetch(
+      `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Shopify-Access-Token': token,
+        },
+        body: JSON.stringify({
+          query: `{ metaobjectDefinitions(first: 5) { edges { node { type } } } }`,
+        }),
+      }
+    );
+    const rawJson = await rawResponse.json();
+    results.rawDefinitionsResponse = rawJson;
+  } catch (err) {
+    results.rawDefinitionsResponse = { error: err.message };
   }
 
   res.json(results);
