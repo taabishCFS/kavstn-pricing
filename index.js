@@ -389,24 +389,6 @@ async function verifyAndPrice(selections) {
 
   const returnedNodes = (data.nodes || []).filter(Boolean);
 
-  /*
-   * ── Debug logging ──────────────────────────────────────────
-   * Logs the metaobject types Shopify actually returned so you
-   * can verify they match the expected types in selectionSchema.
-   * Check your Render service logs after triggering an Add to Order.
-   *
-   * If the types include a prefix (e.g. "custom.table_shape" instead
-   * of "table_shape"), update selectionSchema below to match.
-   *
-   * Remove these console.logs once everything is working correctly.
-   */
-  console.log('[KAVSTN] Requested GIDs:', ids);
-  console.log('[KAVSTN] Shopify returned metaobjects:', returnedNodes.map(n => ({
-    id:          n.id,
-    type:        n.type,
-    displayName: n.displayName,
-  })));
-
   const byId = new Map(
     returnedNodes.map(node => [node.id, node])
   );
@@ -1212,20 +1194,9 @@ app.use(
   }
 );
 
-/*
- * ── /debug-api ────────────────────────────────────────────────
- * Diagnostic endpoint — open in a browser to check whether the
- * server's Shopify credentials work and what scopes are available.
- *
- * URL:  https://kavstn-pricing.onrender.com/debug-api
- *
- * It runs two tests:
- *   1. Fetches an access token (confirms client_id/secret/domain)
- *   2. Runs a lightweight metaobjects query (confirms read_metaobjects scope)
- *
- * REMOVE THIS ENDPOINT before going live — it exposes internal state.
- */
-app.get('/debug-api', async (req, res) => {
+// Debug endpoint removed before go-live.
+// If you need to re-add diagnostics, check git history for the /debug-api block.
+if (false) app.get('/debug-api-disabled', async (req, res) => {
   const results = {};
 
   // ── 1. Auth token ──────────────────────────────────────────
